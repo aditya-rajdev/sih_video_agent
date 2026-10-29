@@ -1,0 +1,6 @@
+FrameForge final corrected build
+
+Preserved existing user-facing features and LinkedIn/X workflow.
+Restored the full working 547-line code generator as the base and added only safety/reliability fixes: complete-HTML retries, safe browser rendering contract, runtime-safe DOM handling, and selected-LLM compatibility for the code fixer.
+
+Verified with Python 3 py_compile for main.py, browser_renderer.py, agents/code_generator.py, agents/code_fixer.py, ffmpeg_renderer.py, and agents/code_validator.py.

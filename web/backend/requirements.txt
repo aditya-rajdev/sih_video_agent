@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic
+langgraph
+langchain-ollama
+langchain-openai
+langchain-google-genai
+langchain-groq
+playwright

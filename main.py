@@ -1,0 +1,3479 @@
+import sys
+import os
+import re
+
+# ============================================================
+# WINDOWS UTF-8 OUTPUT
+# ============================================================
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass
+
+
+from agents.code_validator import validate_scene_file
+from agents.code_fixer import fix_scene_code
+from typing import List
+from typing_extensions import TypedDict
+
+from pydantic import BaseModel
+
+from agents.llm_provider import get_llm
+from langgraph.graph import StateGraph, START, END
+
+from agents.asset_verifier import asset_verifier
+from agents.code_generator import generate_scene_code, save_scene_code
+from agents.script_editor import (
+    edit_video_script,
+    validate_script,
+    save_edited_script,
+    summarize_changes,
+)
+
+from pathlib import Path
+import shutil
+import asyncio
+
+from pipeline_timer import PipelineTimer
+from browser_renderer import render_from_plan, RuntimeSceneError
+from ffmpeg_renderer import render_video_from_frames
+
+
+# ============================================================
+# 1. STORY MODELS
+# ============================================================
+
+def no_images_requested(topic: str) -> bool:
+    text = topic.lower()
+
+    phrases = [
+        "no image",
+        "no images",
+        "without image",
+        "without images",
+        "only text",
+        "use only text",
+        "text only",
+        "don't use images",
+        "do not use images",
+        "dont use images",
+        "no visuals",
+        "without visuals",
+    ]
+
+    return any(phrase in text for phrase in phrases)
+
+
+class Scene(BaseModel):
+    scene_id: int
+    duration: int
+    narration: str
+    visual: str
+
+
+class VideoStory(BaseModel):
+    title: str
+    hook: str
+    total_duration: int
+    scenes: List[Scene]
+
+
+# ============================================================
+# 2. SCENE & STYLE MODELS
+# ============================================================
+
+class SceneStyle(BaseModel):
+    scene_id: int
+    duration: int
+
+    background: str
+    visual_type: str
+
+    image_required: bool
+    image_description: str
+
+    text: str
+    text_position: str
+
+    animation: str
+    transition: str
+    effects: str
+
+
+class VideoPlan(BaseModel):
+    scenes: List[SceneStyle]
+
+
+# ============================================================
+# 3. ASSET MODELS
+# ============================================================
+
+class Asset(BaseModel):
+    asset_id: str
+    scene_id: int
+    asset_type: str
+    source: str
+    required: bool
+    description: str
+
+
+class AssetPlan(BaseModel):
+    assets: List[Asset]
+
+
+# ============================================================
+# 4. IMAGE REQUIREMENT MODELS
+# ============================================================
+
+class ImageRequirement(BaseModel):
+    asset_id: str
+    scene_id: int
+
+    file_name: str
+
+    prompt: str
+
+    status: str
+
+    required: bool
+
+
+class ImageRequirementResult(BaseModel):
+    images: List[ImageRequirement]
+
+
+# ============================================================
+# 5. SCRIPT-FIRST MODELS
+# ============================================================
+
+class Dialogue(BaseModel):
+    character: str
+    line: str
+
+
+class ScriptScene(BaseModel):
+    scene_id: int
+    duration: int
+    narration: str
+    dialogues: List[Dialogue]
+    visual_direction: str
+    on_screen_text: str
+
+
+class VideoScript(BaseModel):
+    title: str
+    hook: str
+    tone: str
+    audience: str
+    total_duration: int
+    scenes: List[ScriptScene]
+    cta: str
+
+
+class ScenePlanning(BaseModel):
+    """Content-aware planning metadata used to determine scene count."""
+
+    complexity: int
+    visual_density: int
+    information_units: int
+    recommended_scene_count: int
+    rationale: str
+
+
+# ============================================================
+# 6. GRAPH STATE
+# ============================================================
+
+class VideoState(TypedDict):
+
+    topic: str
+    duration: int
+    tone: str
+    audience: str
+    language: str
+    detail_level: str
+
+    # Script-first workflow
+    script: VideoScript
+    script_approved: bool
+    script_status: str
+    generate_video: bool
+
+    # LLM provider configuration
+    provider: str
+    api_key: str
+    model: str
+    base_url: str
+
+    story: VideoStory
+
+    video_plan: VideoPlan
+
+    asset_plan: AssetPlan
+
+    image_requirements: ImageRequirementResult
+
+    asset_verification: dict
+
+    generated_scene_files: List[str]
+
+
+# ============================================================
+# 7. PIPELINE HELPERS
+# ============================================================
+
+def clean_generated_outputs():
+    """
+    Remove only files generated by the video pipeline.
+
+    IMPORTANT:
+    output/scripts/ is intentionally NOT deleted because
+    approved scripts are standalone deliverables.
+    """
+
+    for folder in [
+        Path("output/generated_scenes"),
+        Path("output/frames"),
+        Path("output/videos"),
+    ]:
+        if folder.exists():
+            shutil.rmtree(folder)
+
+    Path("output/generated_scenes").mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print("🧹 Old generated video outputs cleaned.")
+
+
+def validate_story_and_plan(
+    story,
+    video_plan,
+    requested_duration,
+):
+    story_scenes = sorted(
+        story.scenes,
+        key=lambda x: x.scene_id,
+    )
+
+    plan_scenes = sorted(
+        video_plan.scenes,
+        key=lambda x: x.scene_id,
+    )
+
+    if not story_scenes:
+        raise ValueError(
+            "Story contains no scenes."
+        )
+
+    if requested_duration <= 0:
+        raise ValueError(
+            "Requested duration must be greater than 0."
+        )
+
+    if story.total_duration != requested_duration:
+        raise ValueError(
+            f"Video duration mismatch: "
+            f"requested {requested_duration}s, "
+            f"but story declared "
+            f"{story.total_duration}s."
+        )
+
+    story_sum = sum(
+        scene.duration
+        for scene in story_scenes
+    )
+
+    if story_sum != requested_duration:
+        raise ValueError(
+            "Story scene durations must sum to exactly "
+            f"{requested_duration}s, "
+            f"but scene sum is {story_sum}s."
+        )
+
+    if story_sum != story.total_duration:
+        raise ValueError(
+            "Story duration mismatch: "
+            f"declared {story.total_duration}s, "
+            f"scene sum is {story_sum}s."
+        )
+
+    story_ids = [
+        scene.scene_id
+        for scene in story_scenes
+    ]
+
+    plan_ids = [
+        scene.scene_id
+        for scene in plan_scenes
+    ]
+
+    if story_ids != plan_ids:
+        raise ValueError(
+            f"Scene ID mismatch. "
+            f"Story={story_ids}, "
+            f"Plan={plan_ids}"
+        )
+
+    for story_scene, plan_scene in zip(
+        story_scenes,
+        plan_scenes,
+    ):
+        if story_scene.duration != plan_scene.duration:
+            raise ValueError(
+                f"Duration mismatch in Scene "
+                f"{story_scene.scene_id}: "
+                f"story={story_scene.duration}s, "
+                f"plan={plan_scene.duration}s"
+            )
+
+    print(
+        f"✅ Duration validation passed: "
+        f"{requested_duration}s / "
+        f"{len(story_scenes)} scenes"
+    )
+
+
+
+
+MAX_RUNTIME_FIX_RETRIES = 3
+
+
+def _runtime_scene_number(runtime_error):
+    """
+    Extract numeric scene ID from values such as:
+        scene_05
+        Scene 5
+        5
+    """
+    value = str(
+        getattr(runtime_error, "scene_id", "")
+    )
+
+    match = re.search(
+        r"(\d+)",
+        value,
+    )
+
+    if not match:
+        return None
+
+    return int(match.group(1))
+
+
+def _runtime_error_message(runtime_error):
+    """
+    Build a useful error message for the LLM code fixer.
+    """
+    parts = []
+
+    message = getattr(
+        runtime_error,
+        "message",
+        None,
+    )
+
+    if message:
+        parts.append(
+            str(message)
+        )
+
+    current_time = getattr(
+        runtime_error,
+        "current_time",
+        None,
+    )
+
+    if isinstance(
+        current_time,
+        (int, float),
+    ):
+        parts.append(
+            f"Runtime time: {current_time:.3f}s"
+        )
+
+    return "\n".join(parts) or str(runtime_error)
+
+
+def run_browser_render_with_runtime_retry(
+    video_plan,
+    timer,
+    state,
+):
+    """
+    Run Playwright rendering with automatic LLM repair for
+    browser-side JavaScript/runtime failures.
+
+    Static HTML validation is handled separately by
+    code_validation_agent().
+
+    FFmpeg is intentionally outside this retry loop.
+    """
+
+    code_llm = get_agent_llm(
+        state
+    )
+
+    for attempt in range(
+        MAX_RUNTIME_FIX_RETRIES + 1
+    ):
+
+        try:
+
+            asyncio.run(
+                render_from_plan(
+                    video_plan
+                )
+            )
+
+            return
+
+        except RuntimeSceneError as exc:
+
+            print(
+                "\n========================================"
+            )
+            print(
+                "BROWSER RUNTIME ERROR"
+            )
+            print(
+                "========================================"
+            )
+            print(
+                f"Scene : "
+                f"{getattr(exc, 'scene_id', 'unknown')}"
+            )
+            print(
+                f"File  : "
+                f"{getattr(exc, 'scene_file', 'unknown')}"
+            )
+            print(
+                f"Time  : "
+                f"{getattr(exc, 'current_time', 'unknown')}"
+            )
+            print(
+                f"Error : "
+                f"{_runtime_error_message(exc)}"
+            )
+
+            if attempt >= MAX_RUNTIME_FIX_RETRIES:
+
+                print(
+                    "\n❌ Maximum browser runtime repair "
+                    "retries reached."
+                )
+
+                raise
+
+            scene_number = (
+                _runtime_scene_number(
+                    exc
+                )
+            )
+
+            if scene_number is None:
+
+                raise RuntimeError(
+                    "Browser reported a runtime error, "
+                    "but the scene number could not be identified."
+                ) from exc
+
+            scene = next(
+                (
+                    item
+                    for item in video_plan.scenes
+                    if int(item.scene_id)
+                    == scene_number
+                ),
+                None,
+            )
+
+            if scene is None:
+
+                raise RuntimeError(
+                    f"Could not find Scene "
+                    f"{scene_number} in the current video plan."
+                ) from exc
+
+            scene_file = Path(
+                getattr(
+                    exc,
+                    "scene_file",
+                    Path(
+                        "output/generated_scenes"
+                    )
+                    / f"scene_{scene_number:02d}.html",
+                )
+            )
+
+            runtime_validation = {
+                "passed": False,
+                "errors": [
+                    "Browser JavaScript runtime error.",
+                    _runtime_error_message(exc),
+                    (
+                        "The generated HTML must be repaired so "
+                        "Chromium can execute every frame safely."
+                    ),
+                ],
+                "warnings": [],
+                "runtime_error": True,
+                "scene_id": scene_number,
+                "current_time": getattr(
+                    exc,
+                    "current_time",
+                    None,
+                ),
+            }
+
+            print(
+                "\n🔧 Sending failed scene to "
+                "the LLM Code Fixer..."
+            )
+
+            fix_scene_code(
+                scene_file=scene_file,
+                validation_result=runtime_validation,
+                scene_plan=scene,
+                llm=code_llm,
+            )
+
+            # Immediately verify that the repaired file is still
+            # structurally valid before launching Chromium again.
+            repaired_validation = (
+                validate_scene_file(
+                    scene_file
+                )
+            )
+
+            if not repaired_validation.get(
+                "passed",
+                False,
+            ):
+
+                print(
+                    "\n⚠️ Runtime repair produced a "
+                    "static validation failure."
+                )
+
+                for error in repaired_validation.get(
+                    "errors",
+                    [],
+                ):
+                    print(
+                        f"   ERROR: {error}"
+                    )
+
+                # Give the same code fixer another chance on the
+                # next runtime-repair iteration.
+                continue
+
+            print(
+                f"\n✅ Runtime repair "
+                f"{attempt + 1}/"
+                f"{MAX_RUNTIME_FIX_RETRIES} complete."
+            )
+
+            print(
+                "🔄 Restarting Playwright rendering..."
+            )
+
+    raise RuntimeError(
+        "Unexpected browser runtime retry termination."
+    )
+
+
+def run_automated_render(
+    video_plan,
+    timer,
+    state,
+):
+    """
+    Full rendering pipeline:
+
+        HTML
+          ↓
+        Playwright + runtime repair
+          ↓
+        FFmpeg
+
+    FFmpeg failures are never passed to the HTML fixer.
+    """
+
+    timer.start_stage(
+        "Browser / Playwright Rendering"
+    )
+
+    try:
+
+        run_browser_render_with_runtime_retry(
+            video_plan,
+            timer,
+            state,
+        )
+
+        timer.end_stage(
+            "Browser / Playwright Rendering",
+            True,
+        )
+
+    except Exception:
+
+        timer.end_stage(
+            "Browser / Playwright Rendering",
+            False,
+        )
+
+        raise
+
+    timer.start_stage(
+        "FFmpeg Rendering"
+    )
+
+    try:
+
+        final_video = (
+            render_video_from_frames()
+        )
+
+        timer.end_stage(
+            "FFmpeg Rendering",
+            True,
+        )
+
+    except Exception:
+
+        timer.end_stage(
+            "FFmpeg Rendering",
+            False,
+        )
+
+        raise
+
+    return final_video
+
+def get_agent_llm(state: VideoState):
+    """
+    Create the selected LLM provider for the current request.
+    """
+
+    return get_llm(
+        provider=state.get(
+            "provider",
+            "local",
+        ),
+        api_key=state.get(
+            "api_key"
+        ),
+        model=state.get(
+            "model"
+        ),
+        base_url=state.get(
+            "base_url"
+        ),
+    )
+
+
+def get_structured_llm(
+    state: VideoState,
+    output_model,
+):
+    """
+    Create selected provider and attach
+    Pydantic structured output.
+    """
+
+    return get_agent_llm(
+        state
+    ).with_structured_output(
+        output_model
+    )
+
+
+# ============================================================
+# 9. SCRIPT WRITER
+# ============================================================
+
+def scene_count_bounds(requested_duration: int):
+    """
+    Return a practical scene-count range for the requested duration.
+
+    The LLM still decides the exact count from content complexity and
+    visual density; these bounds only prevent clearly unreasonable
+    outputs.
+    """
+    if requested_duration <= 0:
+        raise ValueError("Requested duration must be greater than 0.")
+
+    minimum = max(2, round(requested_duration / 10))
+    maximum = max(minimum, round(requested_duration / 3))
+
+    # Keep very long videos from exploding into hundreds of scenes.
+    maximum = min(maximum, 24)
+
+    # At least two scenes are useful for any non-trivial video.
+    minimum = min(minimum, maximum)
+
+    return minimum, maximum
+
+
+def plan_scene_count(state: VideoState) -> ScenePlanning:
+    """
+    Analyze the content first, then decide how many visual scenes the
+    script should contain.
+
+    This is intentionally separate from script generation so that two
+    videos with the same duration can still receive different scene
+    counts when their information density or visual requirements differ.
+    """
+
+    topic = state["topic"]
+    requested_duration = state["duration"]
+    tone = state.get("tone", "educational")
+    audience = state.get("audience", "general audience")
+    language = state.get("language", "English")
+    detail_level = state.get("detail_level", "standard")
+
+    minimum, maximum = scene_count_bounds(requested_duration)
+
+    prompt = f"""
+You are the content-planning agent for a short-form video generator.
+
+Analyze this proposed video BEFORE writing the script.
+
+TOPIC:
+{topic}
+
+DURATION:
+{requested_duration} seconds
+
+TONE:
+{tone}
+
+AUDIENCE:
+{audience}
+
+LANGUAGE:
+{language}
+
+DETAIL LEVEL:
+{detail_level}
+
+Your job is to estimate how much visual segmentation this specific
+content needs.
+
+Consider:
+- number of distinct information units or concepts
+- how much explanation each concept needs
+- factual/detail density
+- visual changes that would improve comprehension
+- storytelling beats, examples, comparisons, or steps
+- whether a concept can remain on screen for several seconds
+- pacing appropriate for the requested duration
+
+IMPORTANT:
+- Do NOT choose the scene count only from duration.
+- Two videos with the same duration may legitimately have different
+  scene counts.
+- Simple content should use fewer, longer scenes.
+- Dense, technical, step-by-step, comparison, or visual-story content
+  may use more scenes.
+- Do not create scenes merely to increase the count.
+- Each scene must represent a meaningful visual/content beat.
+
+For a {requested_duration}-second video, the exact scene count MUST be
+between {minimum} and {maximum}.
+
+Return:
+- complexity: integer 1-5
+- visual_density: integer 1-5
+- information_units: integer 1-20
+- recommended_scene_count: integer {minimum}-{maximum}
+- rationale: short explanation of why this content needs that count
+"""
+
+    plan = get_structured_llm(
+        state,
+        ScenePlanning,
+    ).invoke(prompt)
+
+    if not (1 <= plan.complexity <= 5):
+        raise ValueError("Scene planner returned invalid complexity.")
+
+    if not (1 <= plan.visual_density <= 5):
+        raise ValueError("Scene planner returned invalid visual density.")
+
+    if not (1 <= plan.information_units <= 20):
+        raise ValueError("Scene planner returned invalid information_units.")
+
+    if not (minimum <= plan.recommended_scene_count <= maximum):
+        raise ValueError(
+            "Scene planner returned an unreasonable scene count: "
+            f"{plan.recommended_scene_count}. Expected {minimum}-{maximum} "
+            f"for {requested_duration}s."
+        )
+
+    print("\n========================================")
+    print("CONTENT-AWARE SCENE PLAN")
+    print("========================================")
+    print(f"Complexity: {plan.complexity}/5")
+    print(f"Visual density: {plan.visual_density}/5")
+    print(f"Information units: {plan.information_units}")
+    print(f"Recommended scenes: {plan.recommended_scene_count}")
+    print(f"Rationale: {plan.rationale}")
+    print("========================================\n")
+
+    return plan
+
+
+def normalize_script_durations(
+    script: VideoScript,
+    requested_duration: int,
+) -> VideoScript:
+    """
+    Deterministically normalize generated scene durations so the
+    final script always has exactly the requested total duration.
+
+    LLMs can occasionally return valid-looking scene durations whose
+    sum is a few seconds short/long. We keep the scene count and all
+    scene content unchanged and adjust only the duration values.
+    Every scene receives at least 1 second.
+    """
+
+    if not script.scenes:
+        raise ValueError("Script contains no scenes.")
+
+    if requested_duration < len(script.scenes):
+        raise ValueError(
+            "Requested duration is too short for the generated "
+            f"scene count: {requested_duration}s for "
+            f"{len(script.scenes)} scenes. "
+            "At least 1 second per scene is required."
+        )
+
+    original_sum = sum(
+        max(1, int(scene.duration))
+        for scene in script.scenes
+    )
+
+    # Already correct: do not modify the LLM output.
+    if original_sum == requested_duration:
+        script.total_duration = requested_duration
+        return script
+
+    # Reserve 1 second for every scene, then distribute the remaining
+    # time according to each scene's original duration above 1 second.
+    scene_count = len(script.scenes)
+    remaining = requested_duration - scene_count
+
+    weights = [
+        max(0, max(1, int(scene.duration)) - 1)
+        for scene in script.scenes
+    ]
+    weight_sum = sum(weights)
+
+    if weight_sum == 0:
+        # All scenes originally had 1 second (or invalid/non-positive
+        # values). Distribute the remaining seconds evenly.
+        durations = [1] * scene_count
+        for index in range(remaining):
+            durations[index % scene_count] += 1
+    else:
+        raw = [
+            remaining * weight / weight_sum
+            for weight in weights
+        ]
+        extras = [int(value) for value in raw]
+        leftover = remaining - sum(extras)
+
+        # Largest-remainder allocation guarantees an exact total.
+        order = sorted(
+            range(scene_count),
+            key=lambda i: raw[i] - extras[i],
+            reverse=True,
+        )
+
+        for index in order[:leftover]:
+            extras[index] += 1
+
+        durations = [1 + extra for extra in extras]
+
+    for scene, duration in zip(script.scenes, durations):
+        scene.duration = duration
+
+    normalized_sum = sum(
+        scene.duration
+        for scene in script.scenes
+    )
+
+    if normalized_sum != requested_duration:
+        raise RuntimeError(
+            "Internal duration normalization failed: "
+            f"expected {requested_duration}s, "
+            f"got {normalized_sum}s."
+        )
+
+    script.total_duration = requested_duration
+
+    print(
+        "\n⚠️ LLM returned scene durations totaling "
+        f"{original_sum}s instead of {requested_duration}s."
+    )
+    print(
+        "✅ Scene durations were automatically normalized "
+        "to the requested total. "
+    )
+
+    return script
+
+
+def script_writer(
+    state: VideoState
+):
+    """
+    Generate a standalone script using a content-aware scene count.
+
+    Scene count is decided from both duration and the actual content.
+    It is NOT fixed by duration alone.
+    """
+
+    topic = state["topic"]
+    requested_duration = state["duration"]
+    tone = state.get("tone", "educational")
+    audience = state.get("audience", "general audience")
+    language = state.get("language", "English")
+    detail_level = state.get("detail_level", "standard")
+
+    # First analyze the content. This allows two videos with the same
+    # duration to receive different scene counts.
+    scene_plan = plan_scene_count(state)
+    target_scene_count = scene_plan.recommended_scene_count
+
+    prompt = f"""
+You are an expert short-form educational video script writer.
+
+Create a complete standalone script about:
+
+{topic}
+
+VIDEO DURATION:
+{requested_duration} seconds
+
+CONTENT-AWARE SCENE PLAN:
+- complexity: {scene_plan.complexity}/5
+- visual density: {scene_plan.visual_density}/5
+- information units: {scene_plan.information_units}
+- planned scene count: {target_scene_count}
+- planning rationale: {scene_plan.rationale}
+
+TONE:
+{tone}
+
+AUDIENCE:
+{audience}
+
+LANGUAGE:
+{language}
+
+DETAIL LEVEL:
+{detail_level}
+
+SCRIPT-FIRST RULE:
+The script is a standalone deliverable and will be reviewed by the
+user before video generation.
+
+SCENE COUNT RULE:
+Create EXACTLY {target_scene_count} scenes.
+
+The scene count has already been selected from this specific content's
+complexity, information density, visual requirements, and duration.
+Do not add filler scenes and do not merge meaningful beats just to
+change the count.
+
+Each scene must represent one meaningful visual/content beat.
+Simple material can use longer scenes. Dense material can use shorter
+scenes and more visual changes.
+
+FOR EVERY SCENE:
+- scene_id
+- duration
+- narration
+- dialogues
+- visual_direction
+- on_screen_text
+
+CHARACTER / DIALOGUE RULE:
+Characters are optional.
+Use dialogue only when it genuinely improves explanation or storytelling.
+Do not force characters into every video.
+
+If dialogue is used:
+- Give every character a clear name.
+- Keep dialogue natural and concise.
+- Do not unnecessarily repeat narration.
+- Dialogue must fit the scene duration.
+
+If dialogue is not needed, return an empty dialogues list.
+
+IMPORTANT DURATION RULE:
+The final video duration MUST be exactly {requested_duration} seconds.
+The sum of ALL scene durations MUST equal exactly {requested_duration}.
+The total_duration field MUST equal exactly {requested_duration}.
+Every scene must have at least 1 second.
+
+PACING:
+Allocate more time to concepts that require explanation and less time
+to simple transitions or short visual beats. Do not make every scene
+the same duration unless the content naturally calls for it.
+
+SCRIPT QUALITY:
+- Start with a strong hook.
+- Keep information logically connected.
+- Avoid repetition.
+- Make narration suitable for spoken delivery.
+- Keep on-screen text concise.
+- Visual direction should describe what should be shown.
+- End with a useful CTA when appropriate.
+
+Return only the structured VideoScript.
+"""
+
+    result = get_structured_llm(
+        state,
+        VideoScript,
+    ).invoke(prompt)
+
+    # If the model ignores the exact scene-count instruction, give it a
+    # corrective retry rather than silently accepting the wrong count.
+    if len(result.scenes) != target_scene_count:
+        correction_prompt = f"""
+The generated script has {len(result.scenes)} scenes, but the required
+content-aware scene count is EXACTLY {target_scene_count} scenes.
+
+Rewrite the complete script about:
+{topic}
+
+Requirements:
+- EXACTLY {target_scene_count} scenes.
+- Preserve the important information and logical flow.
+- Do not add filler.
+- Do not lose important concepts.
+- Merge or split meaningful content beats as needed.
+- Total duration must be exactly {requested_duration} seconds.
+- Scene durations must sum to exactly {requested_duration}.
+- Every scene must have at least 1 second.
+- Keep the same tone, audience, language, and detail level.
+
+Return only the complete structured VideoScript.
+"""
+
+        result = get_structured_llm(
+            state,
+            VideoScript,
+        ).invoke(correction_prompt)
+
+    if len(result.scenes) != target_scene_count:
+        raise ValueError(
+            "Scene-count validation failed: "
+            f"expected exactly {target_scene_count} scenes, "
+            f"but the LLM returned {len(result.scenes)} after retry."
+        )
+
+    # Normalize only durations, never scene count or scene content.
+    result = normalize_script_durations(
+        result,
+        requested_duration,
+    )
+
+    # Ensure stable sequential scene IDs.
+    for index, scene in enumerate(result.scenes, start=1):
+        scene.scene_id = index
+
+    print("\n========================================")
+    print("SCRIPT GENERATED")
+    print("========================================")
+    print(f"Title: {result.title}")
+    print(f"Scenes: {len(result.scenes)}")
+    print(f"Duration: {result.total_duration}s")
+    print("========================================\n")
+
+    return {
+        "script": result,
+        "script_approved": False,
+        "script_status": "SCRIPT_READY",
+    }
+
+
+# ============================================================
+# 10. SCRIPT PREVIEW
+# ============================================================
+
+def print_script_preview(
+    script: VideoScript
+):
+    """
+    Print readable standalone script.
+    """
+
+    print(
+        "\n\n========================================"
+    )
+
+    print("SCRIPT PREVIEW")
+
+    print(
+        "========================================"
+    )
+
+    print(
+        f"Title: {script.title}"
+    )
+
+    print(
+        f"Hook: {script.hook}"
+    )
+
+    print(
+        f"Tone: {script.tone}"
+    )
+
+    print(
+        f"Audience: {script.audience}"
+    )
+
+    print(
+        f"Duration: {script.total_duration}s"
+    )
+
+    print(
+        "----------------------------------------"
+    )
+
+    for scene in script.scenes:
+
+        print(
+            f"\nScene {scene.scene_id} "
+            f"— {scene.duration}s"
+        )
+
+        print(
+            f"Narration: {scene.narration}"
+        )
+
+        if scene.dialogues:
+
+            print("Dialogue:")
+
+            for dialogue in scene.dialogues:
+
+                print(
+                    f"  {dialogue.character}: "
+                    f"{dialogue.line}"
+                )
+
+        else:
+
+            print(
+                "Dialogue: None"
+            )
+
+        print(
+            f"Visual: "
+            f"{scene.visual_direction}"
+        )
+
+        print(
+            f"On-screen: "
+            f"{scene.on_screen_text}"
+        )
+
+    print(
+        f"\nCTA: {script.cta}"
+    )
+
+    print(
+        "========================================"
+    )
+
+
+# ============================================================
+# 11. REGENERATE SCRIPT
+# ============================================================
+
+def regenerate_script(
+    state: VideoState
+) -> VideoScript:
+
+    result = script_writer(
+        state
+    )
+
+    return result["script"]
+
+
+# ============================================================
+# 12. SCRIPT APPROVAL GATE
+# ============================================================
+
+def script_preview_and_approval(
+    state: VideoState
+):
+    """
+    Script-first gate.
+
+    Flow:
+
+        Generate script
+              ↓
+        Show script
+              ↓
+        Edit / Regenerate
+              ↓
+        Approve
+              ↓
+        Ask video?
+          /          \
+        NO            YES
+        ↓              ↓
+     Save script    Video pipeline
+     Stop
+    """
+
+    current_script = state["script"]
+
+    # ========================================================
+    # NON-INTERACTIVE / WEB MODE
+    # ========================================================
+
+    env_approval = os.getenv(
+        "FRAMEFORGE_SCRIPT_APPROVED",
+        "",
+    ).strip().lower()
+
+    env_generate_video = os.getenv(
+        "FRAMEFORGE_GENERATE_VIDEO",
+        "",
+    ).strip().lower()
+
+    if not sys.stdin.isatty():
+
+        if env_approval not in {
+            "1",
+            "true",
+            "yes",
+            "y",
+        }:
+            raise RuntimeError(
+                "SCRIPT_NOT_APPROVED: "
+                "review the generated script first, "
+                "then set "
+                "FRAMEFORGE_SCRIPT_APPROVED=true."
+            )
+
+        validate_script(
+            current_script,
+            expected_duration=state["duration"],
+        )
+
+        print_script_preview(
+            current_script
+        )
+
+        if env_generate_video not in {
+            "1",
+            "true",
+            "yes",
+            "y",
+        }:
+
+            print(
+                "\nScript approved, but video "
+                "generation was not requested."
+            )
+
+            return {
+                "script": current_script,
+                "script_approved": True,
+                "generate_video": False,
+                "script_status": "SCRIPT_ONLY",
+            }
+
+        print(
+            "\nScript approved."
+            "\nVideo generation requested."
+            "\nProceeding to Scene Planner...\n"
+        )
+
+        return {
+            "script": current_script,
+            "script_approved": True,
+            "generate_video": True,
+            "script_status": "VIDEO_REQUESTED",
+        }
+
+    # ========================================================
+    # INTERACTIVE CLI MODE
+    # ========================================================
+
+    while True:
+
+        print_script_preview(
+            current_script
+        )
+
+        print(
+            "\nWhat would you like to do?"
+            "\n[A] Approve script"
+            "\n[E] Edit script"
+            "\n[R] Regenerate script"
+            "\n[Q] Quit"
+        )
+
+        choice = input(
+            "\nChoose an action: "
+        ).strip().lower()
+
+        # ====================================================
+        # APPROVE SCRIPT
+        # ====================================================
+
+        if choice in {
+            "a",
+            "approve",
+            "yes",
+            "y",
+        }:
+
+            validate_script(
+                current_script,
+                expected_duration=state["duration"],
+            )
+
+            state["script"] = current_script
+
+            print(
+                "\n========================================"
+            )
+
+            print(
+                "SCRIPT APPROVED"
+            )
+
+            print(
+                "========================================"
+            )
+
+            # IMPORTANT:
+            #
+            # Script approval and video generation
+            # are TWO separate decisions.
+
+            while True:
+
+                video_choice = input(
+                    "\nDo you want to generate a video "
+                    "from this script? [Y]es / [N]o: "
+                ).strip().lower()
+
+                # ------------------------------------------------
+                # YES -> VIDEO PIPELINE
+                # ------------------------------------------------
+
+                if video_choice in {
+                    "y",
+                    "yes",
+                    "generate",
+                    "video",
+                }:
+
+                    print(
+                        "\nVideo generation requested."
+                    )
+
+                    print(
+                        "Proceeding to Scene Planner...\n"
+                    )
+
+                    return {
+                        "script": current_script,
+                        "script_approved": True,
+                        "generate_video": True,
+                        "script_status": "VIDEO_REQUESTED",
+                    }
+
+                # ------------------------------------------------
+                # NO -> SCRIPT ONLY
+                # ------------------------------------------------
+
+                if video_choice in {
+                    "n",
+                    "no",
+                    "stop",
+                    "quit",
+                    "exit",
+                }:
+
+                    print(
+                        "\n========================================"
+                    )
+
+                    print(
+                        "SCRIPT MODE COMPLETE"
+                    )
+
+                    print(
+                        "========================================"
+                    )
+
+                    print(
+                        "\nApproved script will be saved."
+                    )
+
+                    print(
+                        "Video generation was not started."
+                    )
+
+                    return {
+                        "script": current_script,
+                        "script_approved": True,
+                        "generate_video": False,
+                        "script_status": "SCRIPT_ONLY",
+                    }
+
+                print(
+                    "Please enter Y or N."
+                )
+
+        # ====================================================
+        # EDIT SCRIPT
+        # ====================================================
+
+        if choice in {
+            "e",
+            "edit",
+            "edit script",
+        }:
+
+            instruction = input(
+                "\nDescribe exactly what "
+                "you want to change: "
+            ).strip()
+
+            if not instruction:
+
+                print(
+                    "Edit instruction cannot be empty."
+                )
+
+                continue
+
+            print(
+                "\nEditing script..."
+            )
+
+            llm = get_agent_llm(
+                state
+            )
+
+            edited_script = edit_video_script(
+                script=current_script,
+                user_instruction=instruction,
+                llm=llm,
+            )
+
+            validate_script(
+                edited_script,
+                expected_duration=state["duration"],
+            )
+
+            print(
+                "\n========================================"
+            )
+
+            print(
+                "SCRIPT UPDATED"
+            )
+
+            print(
+                "========================================"
+            )
+
+            print(
+                summarize_changes(
+                    current_script,
+                    edited_script,
+                )
+            )
+
+            save_edited_script(
+                edited_script
+            )
+
+            current_script = edited_script
+
+            state["script"] = current_script
+
+            state["script_status"] = (
+                "SCRIPT_EDITED"
+            )
+
+            print(
+                "\nUpdated script is ready "
+                "for review."
+            )
+
+            continue
+
+        # ====================================================
+        # REGENERATE SCRIPT
+        # ====================================================
+
+        if choice in {
+            "r",
+            "regenerate",
+        }:
+
+            print(
+                "\nRegenerating script..."
+            )
+
+            regenerated_script = (
+                regenerate_script(
+                    state
+                )
+            )
+
+            validate_script(
+                regenerated_script,
+                expected_duration=state["duration"],
+            )
+
+            current_script = (
+                regenerated_script
+            )
+
+            state["script"] = (
+                current_script
+            )
+
+            state["script_status"] = (
+                "SCRIPT_READY"
+            )
+
+            print(
+                "\nNew script generated. "
+                "Review it before approval."
+            )
+
+            continue
+
+        # ====================================================
+        # QUIT
+        # ====================================================
+
+        if choice in {
+            "q",
+            "quit",
+            "exit",
+        }:
+
+            print(
+                "\nScript generation "
+                "stopped by user."
+            )
+
+            return {
+                "script": current_script,
+                "script_approved": False,
+                "generate_video": False,
+                "script_status": "CANCELLED",
+            }
+
+        print(
+            "Invalid choice. "
+            "Please select A, E, R, or Q."
+        )
+
+
+# ============================================================
+# 13. STORY WRITER
+# ============================================================
+
+def story_writer(
+    state: VideoState
+):
+    """
+    Convert approved VideoScript into VideoStory.
+    """
+
+    script = state["script"]
+
+    story = VideoStory(
+        title=script.title,
+        hook=script.hook,
+        total_duration=script.total_duration,
+
+        scenes=[
+            Scene(
+                scene_id=scene.scene_id,
+                duration=scene.duration,
+                narration=scene.narration,
+                visual=scene.visual_direction,
+            )
+
+            for scene in script.scenes
+        ],
+    )
+
+    return {
+        "story": story
+    }
+
+
+# ============================================================
+# 14. SCENE & STYLE PLANNER
+# ============================================================
+
+def scene_style_planner(
+    state: VideoState
+):
+
+    story = state["story"]
+
+    topic = state["topic"]
+
+    force_no_images = (
+        no_images_requested(topic)
+    )
+
+    prompt = f"""
+APPROVED SCRIPT IS THE SOURCE OF TRUTH:
+
+- Do NOT rewrite narration.
+- Do NOT rewrite character dialogue.
+- Do NOT invent new spoken content.
+- Do NOT remove spoken content.
+- Only decide visual representation.
+- Keep scene IDs unchanged.
+- Keep scene durations unchanged.
+
+You are a professional motion-graphics director.
+
+Convert this video story into a scene-by-scene
+visual plan.
+
+The final video will be created using:
+
+HTML
+CSS
+JavaScript
+normal local image assets
+animations
+effects
+transitions
+FFmpeg
+
+There is NO live-action filming.
+
+There is NO AI video generation API.
+
+For every scene decide:
+
+1. Background
+2. Visual type
+3. Whether external image is required
+4. Image description if required
+5. Text
+6. Text position
+7. Animation
+8. Transition
+9. Effects
+
+Prefer HTML/CSS/JavaScript visuals whenever possible.
+
+Use external images only when they genuinely
+improve the scene.
+
+Keep visual style consistent.
+
+Final video:
+
+1080 x 1920
+
+Aspect ratio:
+
+9:16
+
+Do NOT request images for every scene.
+
+Use:
+
+- CSS
+- gradients
+- shapes
+- text
+- icons
+- diagrams
+- motion graphics
+
+whenever sufficient.
+
+Only mark image_required=true when
+a real image provides meaningful value.
+
+IMPORTANT DURATION RULE:
+
+Use exact duration from the story.
+
+Do NOT change durations.
+
+USER TOPIC:
+
+{topic}
+
+If the user requested:
+
+NO images
+ONLY TEXT
+TEXT ONLY
+WITHOUT IMAGES
+
+then:
+
+- image_required MUST be false
+- image_description MUST be empty
+- Do NOT request image assets
+- Use HTML/CSS/JavaScript only
+
+NO-IMAGE MODE DETECTED:
+
+{force_no_images}
+
+STORY:
+
+{story}
+"""
+
+    result = get_structured_llm(
+        state,
+        VideoPlan,
+    ).invoke(prompt)
+
+    # ========================================================
+    # DETERMINISTIC NO-IMAGE ENFORCEMENT
+    # ========================================================
+
+    if force_no_images:
+
+        for scene in result.scenes:
+
+            scene.image_required = False
+
+            scene.image_description = ""
+
+    return {
+        "video_plan": result
+    }
+
+
+# ============================================================
+# 15. ASSET PLANNER
+# ============================================================
+
+def asset_planner(
+    state: VideoState
+):
+
+    topic = state["topic"]
+
+    story = state["story"]
+
+    video_plan = state["video_plan"]
+
+    # ========================================================
+    # NO IMAGE MODE
+    # ========================================================
+
+    if no_images_requested(topic):
+
+        print(
+            "\n========================================"
+        )
+
+        print(
+            "ASSET PLANNER"
+        )
+
+        print(
+            "========================================"
+        )
+
+        print(
+            "NO-IMAGE MODE DETECTED"
+        )
+
+        print(
+            "Skipping asset planning."
+        )
+
+        print(
+            "No image assets will be requested."
+        )
+
+        print(
+            "All visuals will use HTML/CSS/JS."
+        )
+
+        print(
+            "========================================\n"
+        )
+
+        return {
+            "asset_plan": AssetPlan(
+                assets=[]
+            )
+        }
+
+    # ========================================================
+    # NO SCENE NEEDS IMAGE
+    # ========================================================
+
+    if not any(
+        scene.image_required
+        for scene in video_plan.scenes
+    ):
+
+        print(
+            "\n========================================"
+        )
+
+        print(
+            "ASSET PLANNER"
+        )
+
+        print(
+            "========================================"
+        )
+
+        print(
+            "No scene requires an image."
+        )
+
+        print(
+            "No assets required."
+        )
+
+        print(
+            "========================================\n"
+        )
+
+        return {
+            "asset_plan": AssetPlan(
+                assets=[]
+            )
+        }
+
+    # ========================================================
+    # LLM ASSET PLANNING
+    # ========================================================
+
+    prompt = f"""
+You are an asset planning agent for an
+HTML/CSS/JavaScript video generator.
+
+Your job is to decide what assets are required.
+
+Possible sources:
+
+1. css
+
+Visual created using HTML/CSS/JavaScript.
+
+Examples:
+
+- gradients
+- shapes
+- text
+- icons
+- simple diagrams
+- particles
+- lines
+- animated circles
+- UI elements
+- motion graphics
+
+2. generate
+
+A real image is required.
+
+The user will manually generate this image.
+
+3. existing
+
+An existing local/project asset can be used.
+
+IMPORTANT:
+
+- Do NOT request images unnecessarily.
+- Prefer CSS/HTML/JavaScript.
+- Use CSS whenever possible.
+- Only use generate when genuinely useful.
+- Do not request an image for every scene.
+- Avoid duplicate images.
+- Every generated asset belongs to a scene.
+- Every asset needs unique asset_id.
+- Do NOT request video generation.
+
+Final video:
+
+1080 x 1920
+9:16 portrait.
+
+STORY:
+
+{story}
+
+VIDEO PLAN:
+
+{video_plan}
+"""
+
+    result = get_structured_llm(
+        state,
+        AssetPlan,
+    ).invoke(prompt)
+
+    return {
+        "asset_plan": result
+    }
+
+
+# ============================================================
+# 16. IMAGE REQUIREMENT AGENT
+# ============================================================
+
+def image_requirement_agent(
+    state: VideoState
+):
+
+    # ========================================================
+    # HARD NO-IMAGE RULE
+    # ========================================================
+
+    if no_images_requested(
+        state["topic"]
+    ):
+
+        print(
+            "\n========================================"
+        )
+
+        print(
+            "IMAGE REQUIREMENTS"
+        )
+
+        print(
+            "========================================"
+        )
+
+        print(
+            "NO-IMAGE MODE DETECTED"
+        )
+
+        print(
+            "No image requirements will be created."
+        )
+
+        print(
+            "========================================\n"
+        )
+
+        return {
+            "image_requirements":
+                ImageRequirementResult(
+                    images=[]
+                )
+        }
+
+    asset_plan = state[
+        "asset_plan"
+    ]
+
+    required_assets = [
+        asset
+
+        for asset in asset_plan.assets
+
+        if asset.source == "generate"
+        and asset.required
+    ]
+
+    # ========================================================
+    # NO IMAGE REQUIRED
+    # ========================================================
+
+    if not required_assets:
+
+        print(
+            "\n========================================"
+        )
+
+        print(
+            "IMAGE REQUIREMENTS"
+        )
+
+        print(
+            "========================================"
+        )
+
+        print(
+            "No external images are required."
+        )
+
+        print(
+            "All visuals can be created using "
+            "HTML/CSS/JS."
+        )
+
+        print(
+            "========================================\n"
+        )
+
+        return {
+            "image_requirements":
+                ImageRequirementResult(
+                    images=[]
+                )
+        }
+
+    # ========================================================
+    # ASSET INFORMATION
+    # ========================================================
+
+    asset_information = "\n\n".join(
+        [
+            f"""
+Asset ID: {asset.asset_id}
+Scene ID: {asset.scene_id}
+Description: {asset.description}
+"""
+            for asset in required_assets
+        ]
+    )
+
+    # ========================================================
+    # IMAGE PROMPT
+    # ========================================================
+
+    prompt = f"""
+You are an Image Requirement Agent.
+
+The user will manually generate required images.
+
+Your job is NOT to generate images.
+
+Your job is to create:
+
+1. Unique filename
+2. Detailed image-generation prompt
+
+for every required image.
+
+FILENAME RULES:
+
+- Safe for Windows.
+- lowercase.
+- underscores instead of spaces.
+- Always .png.
+- Must contain scene number.
+- Unique.
+- No special characters.
+- No path.
+
+Example:
+
+scene_04_seismic_waves.png
+
+IMAGE PROMPT SHOULD DESCRIBE:
+
+- subject
+- composition
+- environment
+- visual style
+- lighting
+- colors
+- perspective
+- important objects
+- image orientation
+- quality requirements
+
+Final video:
+
+1080x1920
+9:16 portrait
+
+Avoid unnecessary text inside generated images.
+
+Do NOT generate images.
+
+Set status:
+
+WAITING_FOR_USER
+
+REQUIRED ASSETS:
+
+{asset_information}
+"""
+
+    result = get_structured_llm(
+        state,
+        ImageRequirementResult,
+    ).invoke(prompt)
+
+    return {
+        "image_requirements": result
+    }
+
+
+# ============================================================
+# 17. CODE GENERATOR
+# ============================================================
+
+def code_generator_agent(
+    state: VideoState
+):
+
+    video_plan = state[
+        "video_plan"
+    ]
+
+    print(
+        "\n\n========================================"
+    )
+
+    print(
+        "HTML/CSS/JS CODE GENERATOR"
+    )
+
+    print(
+        "========================================"
+    )
+
+    generated_files = []
+
+    code_llm = get_agent_llm(
+        state
+    )
+
+    print(
+        "\nCode Generator Provider: "
+        f"{state.get('provider', 'local')}"
+    )
+
+    if state.get("model"):
+
+        print(
+            "Code Generator Model: "
+            f"{state.get('model')}"
+        )
+
+    for scene in video_plan.scenes:
+
+        print(
+            f"\nGenerating code for "
+            f"Scene {scene.scene_id}..."
+        )
+
+        try:
+
+            generated_code = (
+                generate_scene_code(
+                    scene,
+                    code_llm,
+                )
+            )
+
+            file_path = (
+                save_scene_code(
+                    scene.scene_id,
+                    generated_code,
+                )
+            )
+
+            generated_files.append(
+                str(file_path)
+            )
+
+            print(
+                f"✅ Scene "
+                f"{scene.scene_id} generated"
+            )
+
+            print(
+                f"   Saved: {file_path}"
+            )
+
+        except Exception as e:
+
+            print(
+                f"\n❌ Scene "
+                f"{scene.scene_id} "
+                f"code generation failed"
+            )
+
+            print(
+                f"Error: {e}"
+            )
+
+            raise
+
+    print(
+        "\n========================================"
+    )
+
+    print(
+        "CODE GENERATION COMPLETE"
+    )
+
+    print(
+        "========================================"
+    )
+
+    print(
+        f"\nTotal scenes generated: "
+        f"{len(generated_files)}"
+    )
+
+    return {
+        "generated_scene_files":
+            generated_files
+    }
+
+
+# ============================================================
+# 18. CODE VALIDATION + AUTO FIX
+# ============================================================
+
+MAX_CODE_FIX_RETRIES = 3
+
+
+def code_validation_agent(
+    state: VideoState
+):
+
+    video_plan = state[
+        "video_plan"
+    ]
+
+    print(
+        "\n\n========================================"
+    )
+
+    print(
+        "CODE VALIDATION + AUTO FIX"
+    )
+
+    print(
+        "========================================"
+    )
+
+    final_files = []
+
+    code_llm = get_agent_llm(
+        state
+    )
+
+    # For local video code repair, use the dedicated coder model from the
+    # proven video pipeline. API providers continue to use the selected
+    # provider/model configured by the user.
+    if state.get("provider", "local") == "local":
+        from langchain_ollama import ChatOllama
+        code_llm = ChatOllama(
+            model="qwen2.5-coder:3b",
+            temperature=0.1,
+        )
+
+    scenes = sorted(
+        video_plan.scenes,
+        key=lambda item: item.scene_id,
+    )
+
+    for scene in scenes:
+
+        scene_file = (
+            Path(
+                "output/generated_scenes"
+            )
+            / f"scene_{scene.scene_id:02d}.html"
+        )
+
+        if not scene_file.exists():
+
+            raise FileNotFoundError(
+                "Generated scene file not found: "
+                f"{scene_file}"
+            )
+
+        print(
+            f"\nChecking Scene "
+            f"{scene.scene_id}"
+        )
+
+        passed = False
+
+        for attempt in range(
+            MAX_CODE_FIX_RETRIES + 1
+        ):
+
+            validation = (
+                validate_scene_file(
+                    scene_file
+                )
+            )
+
+            if validation["passed"]:
+
+                print(
+                    f"✅ Scene "
+                    f"{scene.scene_id} "
+                    f"validation PASS"
+                )
+
+                for warning in validation.get(
+                    "warnings",
+                    [],
+                ):
+
+                    print(
+                        f"   WARNING: "
+                        f"{warning}"
+                    )
+
+                final_files.append(
+                    str(scene_file)
+                )
+
+                passed = True
+
+                break
+
+            print(
+                f"❌ Scene "
+                f"{scene.scene_id} "
+                f"validation FAIL "
+                f"(attempt "
+                f"{attempt + 1}/"
+                f"{MAX_CODE_FIX_RETRIES + 1})"
+            )
+
+            for error in validation.get(
+                "errors",
+                [],
+            ):
+
+                print(
+                    f"   ERROR: {error}"
+                )
+
+            if attempt >= MAX_CODE_FIX_RETRIES:
+                break
+
+            retry_number = attempt + 1
+
+            print(
+                f"🔧 Code Fixer "
+                f"attempt "
+                f"{retry_number}/"
+                f"{MAX_CODE_FIX_RETRIES}"
+            )
+
+            fix_scene_code(
+                scene_file=scene_file,
+                validation_result=validation,
+                scene_plan=scene,
+                llm=code_llm,
+            )
+
+            print(
+                f"🔄 Scene "
+                f"{scene.scene_id} "
+                f"will be validated again."
+            )
+
+        if not passed:
+
+            raise RuntimeError(
+                f"Scene {scene.scene_id} "
+                "could not pass code validation "
+                f"after {MAX_CODE_FIX_RETRIES} "
+                "automatic fixes."
+            )
+
+    print(
+        "\n========================================"
+    )
+
+    print(
+        "✅ ALL SCENES PASSED CODE VALIDATION"
+    )
+
+    print(
+        "========================================"
+    )
+
+    return {
+        "generated_scene_files":
+            final_files
+    }
+
+
+# ============================================================
+# 19. ASSET VERIFICATION ROUTER
+# ============================================================
+
+def route_after_asset_verification(
+    state: VideoState
+):
+
+    verification = state.get(
+        "asset_verification",
+        {},
+    )
+
+    if verification.get(
+        "passed",
+        False,
+    ):
+
+        print(
+            "\nAsset verification passed. "
+            "Continuing to code generation."
+        )
+
+        return (
+            "code_generator_agent"
+        )
+
+    print(
+        "\nAsset verification failed. "
+        "Stopping pipeline."
+    )
+
+    return (
+        "asset_verification_failed"
+    )
+
+
+def asset_verification_failed(
+    state: VideoState
+):
+    """
+    Terminal node when required assets
+    are missing.
+    """
+
+    verification = state.get(
+        "asset_verification",
+        {},
+    )
+
+    print(
+        "\n========================================"
+    )
+
+    print(
+        "ASSET VERIFICATION FAILED"
+    )
+
+    print(
+        "========================================"
+    )
+
+    for filename in verification.get(
+        "missing_files",
+        [],
+    ):
+
+        print(
+            f"Missing asset: {filename}"
+        )
+
+    print(
+        "\nVideo generation stopped because "
+        "required assets are missing."
+    )
+
+    return {}
+
+
+# ============================================================
+# 20. SCRIPT GATE ROUTER
+# ============================================================
+
+def route_after_script_gate(
+    state: VideoState
+):
+    """
+    Start video pipeline ONLY after
+    explicit video consent.
+    """
+
+    if state.get(
+        "generate_video",
+        False,
+    ):
+
+        return "story_writer"
+
+    return "script_only_end"
+
+
+# ============================================================
+# 21. SCRIPT ONLY END
+# ============================================================
+
+def script_only_end(
+    state: VideoState
+):
+    """
+    Terminal node for script-only mode.
+
+    IMPORTANT:
+
+    The graph ends here when the user approves
+    the script but says NO to video generation.
+
+    The approved script MUST be saved here
+    because no later video-generation node
+    will execute.
+    """
+
+    script = state.get(
+        "script"
+    )
+
+    if script is None:
+
+        raise RuntimeError(
+            "SCRIPT_SAVE_FAILED: "
+            "approved script is missing "
+            "from graph state."
+        )
+
+    # ========================================================
+    # SAVE APPROVED SCRIPT
+    # ========================================================
+
+    save_video_script(
+        script
+    )
+
+    print(
+        "\n========================================"
+    )
+
+    print(
+        "PIPELINE STOPPED AFTER SCRIPT"
+    )
+
+    print(
+        "========================================"
+    )
+
+    print(
+        "\nNo video generation was requested."
+    )
+
+    print(
+        "The approved script has been saved "
+        "to output/scripts/."
+    )
+
+    print(
+        "\nSaved files:"
+    )
+
+    print(
+        "  output/scripts/approved_script.json"
+    )
+
+    print(
+        "  output/scripts/approved_script.txt"
+    )
+
+    return {}
+
+
+# ============================================================
+# 22. BUILD LANGGRAPH
+# ============================================================
+
+graph = StateGraph(
+    VideoState
+)
+
+
+# ============================================================
+# ADD NODES
+# ============================================================
+
+graph.add_node(
+    "script_writer",
+    script_writer,
+)
+
+graph.add_node(
+    "script_preview_and_approval",
+    script_preview_and_approval,
+)
+
+graph.add_node(
+    "script_only_end",
+    script_only_end,
+)
+
+graph.add_node(
+    "story_writer",
+    story_writer,
+)
+
+graph.add_node(
+    "scene_style_planner",
+    scene_style_planner,
+)
+
+graph.add_node(
+    "asset_planner",
+    asset_planner,
+)
+
+graph.add_node(
+    "image_requirement_agent",
+    image_requirement_agent,
+)
+
+graph.add_node(
+    "asset_verifier",
+    asset_verifier,
+)
+
+graph.add_node(
+    "asset_verification_failed",
+    asset_verification_failed,
+)
+
+graph.add_node(
+    "code_generator_agent",
+    code_generator_agent,
+)
+
+graph.add_node(
+    "code_validation_agent",
+    code_validation_agent,
+)
+
+
+# ============================================================
+# ADD EDGES
+# ============================================================
+
+graph.add_edge(
+    START,
+    "script_writer",
+)
+
+graph.add_edge(
+    "script_writer",
+    "script_preview_and_approval",
+)
+
+
+# ============================================================
+# SCRIPT APPROVAL ROUTER
+# ============================================================
+
+graph.add_conditional_edges(
+    "script_preview_and_approval",
+    route_after_script_gate,
+    {
+        "story_writer":
+            "story_writer",
+
+        "script_only_end":
+            "script_only_end",
+    },
+)
+
+
+# ============================================================
+# SCRIPT ONLY -> END
+# ============================================================
+
+graph.add_edge(
+    "script_only_end",
+    END,
+)
+
+
+# ============================================================
+# VIDEO PIPELINE
+# ============================================================
+
+graph.add_edge(
+    "story_writer",
+    "scene_style_planner",
+)
+
+graph.add_edge(
+    "scene_style_planner",
+    "asset_planner",
+)
+
+graph.add_edge(
+    "asset_planner",
+    "image_requirement_agent",
+)
+
+graph.add_edge(
+    "image_requirement_agent",
+    "asset_verifier",
+)
+
+
+# ============================================================
+# ASSET VERIFICATION ROUTER
+# ============================================================
+
+graph.add_conditional_edges(
+    "asset_verifier",
+    route_after_asset_verification,
+    {
+        "code_generator_agent":
+            "code_generator_agent",
+
+        "asset_verification_failed":
+            "asset_verification_failed",
+    },
+)
+
+
+graph.add_edge(
+    "asset_verification_failed",
+    END,
+)
+
+
+# ============================================================
+# CODE PIPELINE
+# ============================================================
+
+graph.add_edge(
+    "code_generator_agent",
+    "code_validation_agent",
+)
+
+graph.add_edge(
+    "code_validation_agent",
+    END,
+)
+
+
+# ============================================================
+# COMPILE GRAPH
+# ============================================================
+
+app = graph.compile()
+
+
+# ============================================================
+# 23. SCRIPT EXPORT
+# ============================================================
+
+def save_video_script(
+    script: VideoScript
+):
+    """
+    Save approved standalone script
+    as JSON and TXT.
+    """
+
+    output_dir = Path(
+        "output/scripts"
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    json_path = (
+        output_dir
+        / "approved_script.json"
+    )
+
+    txt_path = (
+        output_dir
+        / "approved_script.txt"
+    )
+
+    # ========================================================
+    # JSON
+    # ========================================================
+
+    json_path.write_text(
+        script.model_dump_json(
+            indent=2
+        ),
+        encoding="utf-8",
+    )
+
+    # ========================================================
+    # TXT
+    # ========================================================
+
+    lines = [
+        f"TITLE: {script.title}",
+        f"HOOK: {script.hook}",
+        f"TONE: {script.tone}",
+        f"AUDIENCE: {script.audience}",
+        f"DURATION: {script.total_duration}s",
+        "",
+    ]
+
+    for scene in script.scenes:
+
+        lines.append(
+            f"SCENE {scene.scene_id} "
+            f"— {scene.duration}s"
+        )
+
+        lines.append(
+            f"NARRATION: "
+            f"{scene.narration}"
+        )
+
+        if scene.dialogues:
+
+            lines.append(
+                "DIALOGUE:"
+            )
+
+            for dialogue in scene.dialogues:
+
+                lines.append(
+                    f"{dialogue.character}: "
+                    f"{dialogue.line}"
+                )
+
+        else:
+
+            lines.append(
+                "DIALOGUE: None"
+            )
+
+        lines.append(
+            f"VISUAL DIRECTION: "
+            f"{scene.visual_direction}"
+        )
+
+        lines.append(
+            f"ON-SCREEN TEXT: "
+            f"{scene.on_screen_text}"
+        )
+
+        lines.append("")
+
+    lines.append(
+        f"CTA: {script.cta}"
+    )
+
+    txt_path.write_text(
+        "\n".join(lines),
+        encoding="utf-8",
+    )
+
+    print(
+        f"Approved script JSON: "
+        f"{json_path}"
+    )
+
+    print(
+        f"Approved script TXT:  "
+        f"{txt_path}"
+    )
+
+    return (
+        str(json_path),
+        str(txt_path),
+    )
+
+
+# ============================================================
+# 24. MAIN PIPELINE
+# ============================================================
+
+if __name__ == "__main__":
+
+    timer = PipelineTimer()
+
+    timer.start_pipeline()
+
+    try:
+
+        print(
+            "\n========================================"
+        )
+
+        print(
+            "AI HTML/CSS VIDEO GENERATOR"
+        )
+
+        print(
+            "========================================"
+        )
+
+        # ====================================================
+        # TOPIC
+        # ====================================================
+
+        topic = input(
+            "\nEnter video topic: "
+        ).strip()
+
+        if not topic:
+
+            raise ValueError(
+                "Topic cannot be empty."
+            )
+
+        # ====================================================
+        # DURATION
+        # ====================================================
+
+        duration_input = input(
+            "\nEnter video duration in seconds: "
+        ).strip()
+
+        try:
+
+            duration = int(
+                duration_input
+            )
+
+        except ValueError:
+
+            raise ValueError(
+                "Duration must be a whole "
+                "number of seconds."
+            )
+
+        if duration <= 0:
+
+            raise ValueError(
+                "Duration must be greater than 0."
+            )
+
+        print(
+            f"Requested duration: "
+            f"{duration} seconds"
+        )
+
+        # ====================================================
+        # TONE
+        # ====================================================
+
+        tone = input(
+            "\nEnter video tone "
+            "(default: educational): "
+        ).strip() or "educational"
+
+        # ====================================================
+        # AUDIENCE
+        # ====================================================
+
+        audience = input(
+            "Enter target audience "
+            "(default: general audience): "
+        ).strip() or "general audience"
+
+        # ====================================================
+        # LLM PROVIDER
+        # ====================================================
+
+        env_provider = os.getenv(
+            "FRAMEFORGE_PROVIDER",
+            "",
+        ).strip().lower()
+
+        if env_provider:
+
+            provider = env_provider
+
+            api_key = os.getenv(
+                "FRAMEFORGE_API_KEY",
+                "",
+            ).strip()
+
+            model = os.getenv(
+                "FRAMEFORGE_MODEL",
+                "",
+            ).strip()
+
+            base_url = os.getenv(
+                "FRAMEFORGE_BASE_URL",
+                "",
+            ).strip()
+
+            print(
+                f"AI provider: {provider}"
+            )
+
+            if model:
+
+                print(
+                    f"Model: {model}"
+                )
+
+        else:
+
+            provider = input(
+                "\nAI provider "
+                "[local/xai/openai/gemini/custom] "
+                "(default: local): "
+            ).strip().lower() or "local"
+
+            api_key = ""
+
+            model = ""
+
+            base_url = ""
+
+            if provider != "local":
+
+                api_key = input(
+                    "API key: "
+                ).strip()
+
+                model = input(
+                    "Model (optional): "
+                ).strip()
+
+                if provider == "custom":
+
+                    base_url = input(
+                        "Custom OpenAI-compatible "
+                        "base URL: "
+                    ).strip()
+
+        # ====================================================
+        # PROVIDER VALIDATION
+        # ====================================================
+
+        supported_providers = {
+            "local",
+            "xai",
+            "openai",
+            "gemini",
+            "custom",
+        }
+
+        if provider not in supported_providers:
+
+            raise ValueError(
+                f"Unsupported LLM provider: "
+                f"{provider}. "
+                f"Supported providers: "
+                f"{sorted(supported_providers)}"
+            )
+
+        if (
+            provider != "local"
+            and not api_key
+        ):
+
+            raise ValueError(
+                f"API key is required "
+                f"for provider: {provider}"
+            )
+
+        if provider == "custom" and (
+            not model
+            or not base_url
+        ):
+
+            raise ValueError(
+                "Custom provider requires "
+                "both model and base_url."
+            )
+
+        # ====================================================
+        # CLEAN VIDEO OUTPUTS
+        # ====================================================
+
+        clean_generated_outputs()
+
+        # ====================================================
+        # RUN LANGGRAPH
+        # ====================================================
+
+        timer.start_stage(
+            "AI Agent Pipeline"
+        )
+
+        result = app.invoke(
+            {
+                "topic": topic,
+                "duration": duration,
+                "tone": tone,
+                "audience": audience,
+
+                "provider": provider,
+                "api_key": api_key,
+                "model": model,
+                "base_url": base_url,
+
+                "generate_video": False,
+            }
+        )
+
+        timer.end_stage(
+            "AI Agent Pipeline",
+            True,
+        )
+
+        # ====================================================
+        # SCRIPT NOT APPROVED
+        # ====================================================
+
+        if not result.get(
+            "script_approved",
+            False,
+        ):
+
+            print(
+                "\nPipeline ended before "
+                "video generation."
+            )
+
+            timer.end_pipeline(
+                False
+            )
+
+            raise SystemExit(0)
+
+        # ====================================================
+        # SCRIPT-ONLY MODE
+        #
+        # IMPORTANT:
+        #
+        # script_only_end() already saved
+        # the script.
+        #
+        # Do NOT run any video stage.
+        # ====================================================
+
+        if not result.get(
+            "generate_video",
+            False,
+        ):
+
+            print(
+                "\n========================================"
+            )
+
+            print(
+                "SCRIPT SAVED"
+            )
+
+            print(
+                "========================================"
+            )
+
+            print(
+                "\nThe pipeline stopped "
+                "after script approval."
+            )
+
+            print(
+                "No Scene Planner was executed "
+                "after the script-only decision."
+            )
+
+            print(
+                "\nFiles:"
+            )
+
+            print(
+                "  output/scripts/approved_script.json"
+            )
+
+            print(
+                "  output/scripts/approved_script.txt"
+            )
+
+            timer.end_pipeline(
+                True
+            )
+
+            raise SystemExit(0)
+
+        # ====================================================
+        # VIDEO MODE
+        #
+        # Save approved script again here as a
+        # safety/persistence point before video
+        # generation.
+        # ====================================================
+
+        script = result[
+            "script"
+        ]
+
+        save_video_script(
+            script
+        )
+
+        # ====================================================
+        # GET VIDEO STATE
+        # ====================================================
+
+        story = result[
+            "story"
+        ]
+
+        video_plan = result[
+            "video_plan"
+        ]
+
+        # ====================================================
+        # VALIDATE STORY + PLAN
+        # ====================================================
+
+        validate_story_and_plan(
+            story,
+            video_plan,
+            duration,
+        )
+
+        # ====================================================
+        # ASSET VERIFICATION
+        # ====================================================
+
+        verification = result[
+            "asset_verification"
+        ]
+
+        if not verification.get(
+            "passed",
+            False,
+        ):
+
+            print(
+                "\n========================================"
+            )
+
+            print(
+                "❌ REQUIRED IMAGES ARE MISSING"
+            )
+
+            print(
+                "========================================"
+            )
+
+            for filename in verification.get(
+                "missing_files",
+                [],
+            ):
+
+                print(
+                    f"❌ {filename}"
+                )
+
+            print(
+                "\nGenerate the missing images "
+                "and put them in "
+                "assets/images/, "
+                "then run the pipeline again."
+            )
+
+            timer.end_pipeline(
+                False
+            )
+
+            raise SystemExit(1)
+
+        # ====================================================
+        # GENERATED HTML FILES
+        # ====================================================
+
+        generated_files = result[
+            "generated_scene_files"
+        ]
+
+        print(
+            "\n========================================"
+        )
+
+        print(
+            "GENERATED SCENE FILES"
+        )
+
+        print(
+            "========================================"
+        )
+
+        for file_path in generated_files:
+
+            print(
+                f"✅ {file_path}"
+            )
+
+        # ====================================================
+        # BROWSER + FFMPEG
+        # ====================================================
+
+        final_video = (
+            run_automated_render(
+                video_plan,
+                timer,
+                result,
+            )
+        )
+
+        # ====================================================
+        # FINAL
+        # ====================================================
+
+        print(
+            "\n========================================"
+        )
+
+        print(
+            "🎉 FINAL VIDEO READY"
+        )
+
+        print(
+            "========================================"
+        )
+
+        print(
+            f"🎥 {final_video}"
+        )
+
+        timer.end_pipeline(
+            True
+        )
+
+    # ========================================================
+    # SYSTEM EXIT
+    # ========================================================
+
+    except SystemExit:
+
+        raise
+
+    # ========================================================
+    # GENERAL ERROR
+    # ========================================================
+
+    except Exception as e:
+
+        print(
+            "\n========================================"
+        )
+
+        print(
+            "❌ PIPELINE FAILED"
+        )
+
+        print(
+            "========================================"
+        )
+
+        print(
+            f"\nError: {e}"
+        )
+
+        timer.end_pipeline(
+            False
+        )
+
+        raise
+# ============================================================
+# WEB/API VIDEO ENTRYPOINT
+# ============================================================
+
+def run_video_from_approved_script(state):
+    """Run only the downstream video pipeline for an already-approved script.
+
+    This is used by the web dashboard. It deliberately skips the interactive
+    CLI script gate because approval has already happened in the UI.
+    """
+    state = dict(state)
+    state["script_approved"] = True
+    state["generate_video"] = True
+    state["script_status"] = "VIDEO_REQUESTED"
+
+    script = state.get("script")
+    if script is None:
+        raise ValueError("Approved script is missing.")
+
+    validate_script(script, expected_duration=state["duration"])
+    save_video_script(script)
+    clean_generated_outputs()
+
+    timer = PipelineTimer()
+    timer.start_pipeline()
+
+    try:
+        updates = {}
+
+        for node in (
+            story_writer,
+            scene_style_planner,
+            asset_planner,
+            image_requirement_agent,
+            asset_verifier,
+        ):
+            node_state = dict(state)
+            node_state.update(updates)
+            result = node(node_state)
+            if result:
+                updates.update(result)
+
+        if not updates.get("asset_verification", {}).get("passed", False):
+            raise RuntimeError(
+                "Required visual assets are missing: "
+                + ", ".join(
+                    updates.get("asset_verification", {}).get("missing_files", [])
+                )
+            )
+
+        node_state = dict(state)
+        node_state.update(updates)
+        result = code_generator_agent(node_state)
+        if result:
+            updates.update(result)
+
+        node_state = dict(state)
+        node_state.update(updates)
+        result = code_validation_agent(node_state)
+        if result:
+            updates.update(result)
+
+        final_state = dict(state)
+        final_state.update(updates)
+        final_video = run_automated_render(
+            final_state["video_plan"],
+            timer,
+            final_state,
+        )
+        timer.end_pipeline(True)
+        return final_video, final_state
+
+    except Exception:
+        timer.end_pipeline(False)
+        raise

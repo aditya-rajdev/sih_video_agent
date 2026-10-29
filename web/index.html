@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Content Generator</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <img class="topbar-india-art" src="/assets/appbar_india_header.png" alt="" aria-hidden="true">
+  <div class="brand">
+    <div class="emblem">✦</div>
+    <div class="brand-text">
+      <strong>भारत सरकार</strong>
+      <span>Government of India</span>
+    </div>
+    <div class="brand-divider"></div>
+    <div>
+      <h1>AI Content Generator</h1>
+      <p>Transform Information into Impactful Communication</p>
+    </div>
+  </div>
+  <nav class="topnav">
+    <a class="active" href="#">⌂ Home</a>
+    <a href="#workflow">▣ Guidelines</a>
+    <a href="#help">? Help</a>
+    <span class="language">◎ English⌄</span>
+    <span class="profile">A</span>
+    <span>Aditya Raj⌄</span>
+  </nav>
+</header>
+
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="side-brand">✦ <span>AI CONTENT AGENT</span></div>
+    <button class="side-item active">⌂ <span>Dashboard</span></button>
+    <button class="side-item">＋ <span>Create Content</span></button>
+    <button class="side-item">▣ <span>My Projects</span></button>
+    <button class="side-item">◈ <span>Templates</span></button>
+    <button class="side-item">▥ <span>Data & Reports</span></button>
+    <button class="side-item">⚙ <span>Settings</span></button>
+    <div class="side-spacer"></div>
+    <div class="digital">Digital India<br><b>Stronger India</b><div class="tricolor"><i></i><i></i><i></i></div></div>
+    <div class="help-card" id="help"><b>◉ Need Help?</b><span>support@gov.in</span></div>
+  </aside>
+
+  <main class="main">
+    <section class="hero-card">
+      <div>
+        <span class="eyebrow">AI-POWERED CONTENT CREATION</span>
+        <h2>Turn Information into<br><span>Impactful Communication</span></h2>
+        <p>Convert reports, articles, documents or ideas into videos, social posts and other communication deliverables from one workspace.</p>
+      </div>
+      <div class="hero-art"><span>in</span><span>𝕏</span><span>▶</span><span>▤</span><div class="laptop">AI<br><small>CONTENT</small></div></div>
+    </section>
+
+    <section class="steps" id="workflow">
+      <div class="step active"><b>1</b><div><strong>Input Content</strong><small>Add source information</small></div></div>
+      <div class="step active"><b>2</b><div><strong>Select Output(s)</strong><small>Choose content formats</small></div></div>
+      <div class="step"><b>3</b><div><strong>Configure</strong><small>Set preferences</small></div></div>
+      <div class="step"><b>4</b><div><strong>Generate</strong><small>Review & download</small></div></div>
+    </section>
+
+    <section class="workspace-grid">
+      <div class="left-column">
+        <section class="panel source-panel">
+          <div class="panel-heading">
+            <div><span class="panel-icon">↥</span><div><h3>1. Add Your Source Content</h3><p>Enter source information or a simple prompt.</p></div></div>
+            <button class="ghost" id="exampleBtn">✦ Try Example</button>
+          </div>
+          <div class="source-tabs">
+            <button class="source-tab active">✦ Text / Prompt</button>
+            <button class="source-tab disabled">⇧ Upload File <small>soon</small></button>
+            <button class="source-tab disabled">↗ Web Link <small>soon</small></button>
+            <button class="source-tab disabled">▧ Image <small>soon</small></button>
+            <button class="source-tab disabled">▣ Video <small>soon</small></button>
+          </div>
+          <textarea id="topic" maxlength="10000" placeholder="Paste a report, advisory, article, research summary or describe what you want to communicate..."></textarea>
+          <div class="input-foot"><span>Example: Paste a news article, report, policy document or describe your topic.</span><span id="counter">0/10000</span></div>
+          <div class="example-row">
+            <button class="example-chip" data-example="Create an awareness message explaining why road safety and helmet use are important for citizens.">🟢 Road Safety</button>
+            <button class="example-chip" data-example="Explain how a solar eclipse happens in simple language for a general audience.">🔵 Solar Eclipse</button>
+            <button class="example-chip" data-example="Create an awareness communication about keeping public places clean and reducing waste.">🟣 Clean India</button>
+            <button class="example-chip" data-example="Summarize a government technology announcement into clear public communication.">🟠 Technology Update</button>
+          </div>
+        </section>
+
+        <section class="panel output-panel">
+          <div class="panel-heading compact">
+            <div><span class="panel-icon">▣</span><div><h3>2. Select Output Type(s)</h3><p>Generate multiple deliverables from the same source.</p></div></div>
+            <label class="select-all"><input type="checkbox" id="selectAll"> Select All</label>
+          </div>
+          <div class="output-grid">
+            <button class="output-card selected" data-output="video"><span class="check">✓</span><div class="output-icon video-icon">▶</div><strong>Video</strong><small>Script, visuals, narration</small></button>
+            <button class="output-card selected" data-output="linkedin"><span class="check">✓</span><div class="output-icon linkedin-icon">in</div><strong>LinkedIn Post</strong><small>Professional post</small></button>
+            <button class="output-card selected" data-output="x"><span class="check">✓</span><div class="output-icon x-icon">𝕏</div><strong>Twitter / X Post</strong><small>Post or thread</small></button>
+            <button class="output-card disabled-output" disabled><div class="output-icon advisory-icon">▤</div><strong>Advisory</strong><small>Coming soon</small></button>
+            <button class="output-card disabled-output" disabled><div class="output-icon info-icon">◆</div><strong>Infographic</strong><small>Coming soon</small></button>
+            <button class="output-card disabled-output" disabled><div class="output-icon summary-icon">▥</div><strong>Executive Summary</strong><small>Coming soon</small></button>
+            <button class="output-card disabled-output" disabled><div class="output-icon presentation-icon">▣</div><strong>Presentation</strong><small>Coming soon</small></button>
+            <button class="output-card disabled-output" disabled><div class="output-icon custom-icon">⊞</div><strong>Custom Output</strong><small>Coming soon</small></button>
+          </div>
+        </section>
+      </div>
+
+      <aside class="right-column">
+        <section class="panel preferences">
+          <div class="panel-heading compact"><div><span class="panel-icon">⚙</span><div><h3>3. Preferences</h3><p>Applied to all selected outputs.</p></div></div></div>
+          <label>Target Audience<select id="audience"><option>General Audience</option><option>Citizens</option><option>Students</option><option>Children under 18</option><option>Technical Audience</option></select></label>
+          <label>Tone / Style<select id="tone"><option value="educational">Educational</option><option value="professional">Professional</option><option value="informative">Informative</option><option value="awareness">Awareness</option><option value="concise">Concise</option></select></label>
+          <label>Language<select id="language"><option>English</option><option>Hindi</option><option>Hinglish</option><option>English + Hindi</option></select></label>
+          <label>Detail Level<select id="detailLevel"><option value="standard">Standard</option><option value="concise">Concise</option><option value="detailed">Detailed</option></select></label>
+          <div id="videoDurationGroup"><label>Video Duration<select id="duration"><option value="30">30 seconds</option><option value="60" selected>60 seconds</option><option value="90">90 seconds</option><option value="120">120 seconds</option><option value="180">180 seconds</option></select></label></div>
+        </section>
+
+        <section class="panel ai-panel">
+          <div class="panel-heading compact"><div><span class="panel-icon">✦</span><div><h3>AI Provider / Model</h3><p>Use local AI or an API.</p></div></div></div>
+          <label>Provider<select id="provider"><option value="local">Local Ollama — qwen3:8b</option><option value="openai">OpenAI API</option><option value="xai">Grok / xAI API</option><option value="gemini">Google Gemini API</option><option value="groq">Groq API</option><option value="custom">Custom OpenAI-compatible API</option></select></label>
+          <label>Model<input id="model" placeholder="Auto / default model"></label>
+          <div id="apiGroup" class="hidden"><label>API Key<input id="apiKey" type="password" autocomplete="off" placeholder="Enter provider API key"></label></div>
+          <div id="customGroup" class="hidden"><label>Base URL<input id="baseUrl" placeholder="https://example.com/v1"></label></div>
+          <div id="codeModelGroup" class="hidden"><label>Video Code Model <input id="codeModel" placeholder="Optional; defaults to selected model"></label></div>
+        </section>
+
+        <section class="tips">
+          <h3>💡 Tips for Better Results</h3>
+          <p>✓ Give a clear and specific source.</p><p>✓ Mention important facts or key points.</p><p>✓ Select outputs that match your communication goal.</p><p>✓ You can review the video script before rendering.</p>
+        </section>
+      </aside>
+    </section>
+
+    <button id="generateBtn" class="generate-main">✦ Generate Selected Content <span>→</span></button>
+
+    <section id="statusPanel" class="panel status hidden">
+      <div class="status-top"><div><span class="eyebrow">WORKFLOW</span><h3 id="stage">Starting...</h3></div><strong id="progressText">0%</strong></div>
+      <div class="progress"><div id="progressBar"></div></div>
+      <pre id="logs"></pre>
+    </section>
+
+    <section id="results" class="results hidden">
+      <div class="results-heading"><div><span class="eyebrow">GENERATED OUTPUTS</span><h2>Your selected deliverables</h2><p>Each output comes from the same source and shared preferences.</p></div><button id="downloadAll" class="ghost">⇩ Download All</button></div>
+      <div id="outputResults" class="result-grid"></div>
+    </section>
+
+    <section id="scriptReview" class="panel script-review hidden">
+      <div class="results-heading"><div><span class="eyebrow">VIDEO SCRIPT REVIEW</span><h2>Review before video generation</h2><p>The video renderer will not start until you approve this script.</p></div><span id="scriptStatus" class="status-pill">DRAFT</span></div>
+      <div id="scriptMeta" class="script-meta"></div>
+      <div id="scriptContent"></div>
+      <div id="editBox" class="edit-box hidden"><label>What should be changed?</label><textarea id="editInstruction" placeholder="Example: Make the explanation simpler and remove repeated information."></textarea><div class="button-row"><button id="applyEditBtn">Apply Edit</button><button id="cancelEditBtn" class="ghost">Cancel</button></div></div>
+      <div class="button-row review-actions"><button id="editScriptBtn" class="ghost">✎ Edit Script</button><button id="regenerateScriptBtn" class="ghost">↻ Regenerate</button><button id="approveScriptBtn" class="approve">✓ Approve Script</button></div>
+    </section>
+
+    <section id="videoDecision" class="decision hidden">
+      <div><span class="eyebrow">NEXT STEP</span><h2>Do you want to create the video?</h2><p>The script is approved. Rendering will start only if you choose Yes.</p></div>
+      <div class="button-row"><button id="generateVideoBtn" class="approve">▶ Yes, Generate Video</button><button id="saveScriptBtn" class="ghost">↓ No, Save Script</button></div>
+    </section>
+
+    <section id="videoResult" class="panel video-result hidden">
+      <div class="results-heading"><div><span class="eyebrow">VIDEO READY</span><h2>Final video</h2></div><a id="downloadVideo" class="download">⇩ Download MP4</a></div>
+      <video id="video" controls playsinline></video>
+    </section>
+
+    <div id="errorPanel" class="error hidden"></div>
+  </main>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
